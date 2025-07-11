@@ -1,6 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from fastapi.security import HTTPBearer
-from fastapi.openapi.utils import get_openapi
 from sqlalchemy.orm import Session
 from stockfish import Stockfish
 from database.database import get_db 
@@ -17,6 +16,7 @@ import math
 import math
 import os
 import chess
+import serial
 
 app = FastAPI(
     title="Pychess",
@@ -334,35 +334,41 @@ def analyze_move(move: str,  db: Session = Depends(get_db)):
     }
 
 @app.post("/play_game/", tags=['GAME'])
-async def play_game(move: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    """ O usuário joga, e o Stockfish responde com a melhor jogada, verificando capturas. """
+async def play_game(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """ O sistema detecta o movimento físico no tabuleiro real e joga contra o Stockfish. """
 
-    # Verifica se há um jogo ativo
+    # 1. Verifica se há um jogo ativo
     game = db.query(Game).filter(Game.player_win == 0).first()
     if not game:
         raise HTTPException(status_code=400, detail="Nenhum jogo ativo encontrado!")
 
-    # Obtém o último estado salvo do tabuleiro
+    # 2. Recupera o último estado do FEN e converte para board
     last_move = db.query(Move).filter(Move.game_id == game.id).order_by(Move.id.desc()).first()
-
-    # Se houver um estado salvo, carregamos ele; caso contrário, criamos um novo tabuleiro
     board = chess.Board(last_move.board_string) if last_move and last_move.board_string else chess.Board()
 
-    # Verifica se a jogada do jogador é válida
+    # 3. Converte FEN para matriz para fazer comparação
+    previous_matrix = fen_to_matrix(board.board_fen())
+
+    # 4. Lê nova matriz via serial
+    current_matrix = read_board_matrix_serial(port='COM3', baudrate=9600)
+
+    # 5. Detecta movimento físico
+    from_square, to_square = detect_physical_move(previous_matrix, current_matrix)
+    if not from_square or not to_square:
+        raise HTTPException(status_code=400, detail="Não foi possível detectar o movimento!")
+
+    move = from_square + to_square  # Notação UCI
+
+    # 6. Valida jogada
     if move not in [m.uci() for m in board.legal_moves]:
-        raise HTTPException(status_code=400, detail="Movimento do jogador inválido!")
+        raise HTTPException(status_code=400, detail=f"Movimento físico inválido: {move}")
 
-    # Aplica o movimento do jogador no tabuleiro
+    # 7. Aplica e salva jogada
     board.push(chess.Move.from_uci(move))
-
-    # Atualiza o Stockfish com o novo estado do jogo
     stockfish.set_fen_position(board.fen())
-
-    # Análise da jogada
     analysis = analyze_move(move, db)
     classification = analysis["classification"]
 
-    # Salva o movimento do jogador no banco
     new_move = Move(
         is_player=True,
         move=move,
@@ -374,12 +380,11 @@ async def play_game(move: str, background_tasks: BackgroundTasks, db: Session = 
     db.add(new_move)
     db.commit()
 
-    # Verifica xeque-mate após o movimento do jogador
+    # 8. Xeque-mate após jogada do jogador?
     if board.is_checkmate():
-        game.player_win = 1  # Brancas venceram
+        game.player_win = 1
         db.commit()
         rating(game.user_id)
-
         return {
             "message": "Xeque-mate! Brancas venceram!",
             "board_fen": board.fen(),
@@ -387,48 +392,34 @@ async def play_game(move: str, background_tasks: BackgroundTasks, db: Session = 
             "stockfish_move": None
         }
 
-    # Stockfish responde com o melhor movimento
+    # 9. Stockfish responde
     best_move = stockfish.get_best_move()
-    if best_move:
-        stockfish_move = chess.Move.from_uci(best_move)
+    if best_move and chess.Move.from_uci(best_move) in board.legal_moves:
+        board.push(chess.Move.from_uci(best_move))
+        stockfish.set_fen_position(board.fen())
 
-        # Se for válido, aplicamos no tabuleiro
-        if stockfish_move in board.legal_moves:
-            board.push(stockfish_move)
-            stockfish.set_fen_position(board.fen())
+        sf_move = Move(
+            is_player=False,
+            move=best_move,
+            board_string=board.fen(),
+            game_id=game.id,
+            mv_quality=None,
+            created_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        )
+        db.add(sf_move)
+        db.commit()
 
-            # Salva a jogada do Stockfish
-            sf_move = Move(
-                is_player=False,
-                move=best_move,
-                board_string=board.fen(),
-                game_id=game.id,
-                mv_quality=None,
-                created_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            )
-            db.add(sf_move)
+        if board.is_checkmate():
+            game.player_win = 2
             db.commit()
-
-            # Verifica xeque-mate após a jogada do Stockfish
-            if board.is_checkmate():
-                game.player_win = 2  # Pretas venceram
-                db.commit()
-                rating(game.user_id)
-
-                return {
-                    "message": "Xeque-mate! Pretas venceram!",
-                    "board_fen": board.fen(),
-                    "player_move": move,
-                    "stockfish_move": best_move
-                }
-        else:
+            rating(game.user_id)
             return {
-                "message": "Movimento do Stockfish inválido. Tentando novamente...",
+                "message": "Xeque-mate! Pretas venceram!",
                 "board_fen": board.fen(),
                 "player_move": move,
-                "stockfish_move": None
+                "stockfish_move": best_move
             }
-        
+
     background_tasks.add_task(calculate_and_save_evaluation, game.id, db)
 
     return {
@@ -437,6 +428,7 @@ async def play_game(move: str, background_tasks: BackgroundTasks, db: Session = 
         "player_move": move,
         "stockfish_move": best_move
     }
+
 
 def calculate_and_save_evaluation(game_id: int, db: Session):
     moves = db.query(Move.move).filter(Move.game_id == game_id).order_by(Move.id).all()
@@ -539,3 +531,54 @@ def get_move_vector(move: str):
         "dy": dy,
         "angle_deg": angle_deg  # usado sempre a partir da posição 0
     }
+
+def read_board_matrix_serial(port='COM3', baudrate=9600):
+    ser = serial.Serial(port, baudrate, timeout=2)
+    board = []
+    while len(board) < 8:
+        line = ser.readline().decode().strip()
+        if line:
+            row = list(map(int, line.split(',')))
+            if len(row) == 8:
+                board.append(row)
+    ser.close()
+    return board
+
+def detect_physical_move(before, after):
+    from_pos, to_pos = None, None
+    for i in range(8):
+        for j in range(8):
+            if before[i][j] != after[i][j]:
+                if before[i][j] != 0 and after[i][j] == 0:
+                    from_pos = (i, j)
+                elif before[i][j] == 0 and after[i][j] != 0:
+                    to_pos = (i, j)
+
+    if from_pos and to_pos:
+        return coords_to_uci(from_pos), coords_to_uci(to_pos)
+    return None, None
+
+def coords_to_uci(pos):
+    col = chr(ord('a') + pos[1])  # coluna (0 → 'a')
+    row = str(8 - pos[0])         # linha (0 → '8')
+    return f"{col}{row}"
+
+def fen_to_matrix(fen):
+    board_part = fen.split(' ')[0]
+    matrix = []
+    row = []
+    for char in board_part:
+        if char == '/':
+            matrix.append(row)
+            row = []
+        elif char.isdigit():
+            row.extend([0] * int(char))
+        else:
+            if char.isupper():
+                row.append(1)  # branca
+            else:
+                row.append(2)  # preta
+    matrix.append(row)
+    return matrix
+
+
