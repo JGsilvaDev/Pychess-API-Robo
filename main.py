@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Depends, Security, HTTPException, BackgroundTasks
 from fastapi.security import HTTPBearer
 from sqlalchemy.orm import Session
 from stockfish import Stockfish
@@ -6,16 +6,24 @@ from database.database import get_db
 from datetime import datetime
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime, timedelta
+from uuid import uuid4
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from Model.users import User
 from Model.games import Game
 from Model.moves import Move
 from Model.evaluation import Evaluation
+from Model.robotToken import RobotToken
 
 import math
+import jwt
 import math
 import os
 import chess
+import smtplib
 import serial
 
 app = FastAPI(
@@ -60,6 +68,8 @@ board = chess.Board()
 
 # Lista global para armazenar até 3 últimas partidas
 game_history = []
+
+modo_robo_ativo = False
 
 def fen_to_matrix(fen):
     """Converte um FEN em uma matriz 8x8 representando o tabuleiro."""
@@ -580,5 +590,116 @@ def fen_to_matrix(fen):
                 row.append(2)  # preta
     matrix.append(row)
     return matrix
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security), db: Session = Depends(get_db)):
+    token = credentials.credentials
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        
+        user_id = payload.get("id")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+
+        return user
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+@app.get("/get-robo-mode/", tags=['ROBOT'])
+def get_robo_mode():
+    global modo_robo_ativo
+
+    return {"robo_mode": modo_robo_ativo}
+
+@app.post("/set-robo-mode/", tags=['ROBOT'])
+def set_robo_mode(data: dict):
+    global modo_robo_ativo
+    ativo = data.get("ativo")
+    if ativo is None:
+        raise HTTPException(status_code=400, detail="Campo 'ativo' obrigatório")
+    modo_robo_ativo = bool(ativo)
+    return {"status": "ok", "robo_mode": modo_robo_ativo}
+
+
+def send_email(email: str, token: str):
+    msg = MIMEMultipart()
+    msg["From"] = os.getenv("SMTP_EMAIL")
+    msg["To"] = email
+    msg["Subject"] = "Token para ativar modo Robô"
+
+    body = f"""
+    <p>Olá,</p>
+    <p>Você solicitou ativar o modo robô em sua plataforma de xadrez.</p>
+    <p>Seu token de verificação é:</p>
+    <h2>{token}</h2>
+    <p>Copie e cole esse código no campo solicitado. Este token é válido por tempo limitado e só pode ser usado uma vez.</p>
+    <p>Se você não solicitou isso, ignore este e-mail.</p>
+    """
+
+    msg.attach(MIMEText(body, "html"))
+
+    try:
+        server = smtplib.SMTP(os.getenv("SMTP_SERVER"), os.getenv("SMTP_PORT"))
+        server.starttls()
+        server.login(os.getenv("SMTP_EMAIL"), os.getenv("SMTP_PASSWORD"))
+        server.sendmail(os.getenv("SMTP_EMAIL"), email, msg.as_string())
+        server.quit()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao enviar e-mail: {str(e)}")
+
+@app.post("/generate-robo-token/", tags=['ROBOT'])
+def generate_robo_token(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    try:
+        sete_dias_atras = datetime.utcnow() - timedelta(days=7)
+
+        # Verifica se já existe um token usado nos últimos 7 dias
+        existing_token = db.query(RobotToken).filter(
+            RobotToken.user_id == user.id,
+            RobotToken.used == True,
+            RobotToken.created_at >= sete_dias_atras
+        ).order_by(RobotToken.created_at.desc()).first()
+
+        if existing_token:
+            global modo_robo_ativo
+            modo_robo_ativo = True
+
+            return {"message": "Token já utilizado nos últimos 7 dias, modo robô já foi ativado recentemente."}
+
+        # Caso não exista, gerar novo token
+        token_str = str(uuid4()).split("-")[0]
+        token = RobotToken(user_id=user.id, token=token_str)
+        db.add(token)
+        db.commit()
+
+        send_email(user.email, token_str)
+
+        return {"message": "Token enviado para seu e-mail"}
+
+    except Exception as e:
+        print("❌ ERRO AO GERAR TOKEN:", e)
+        raise HTTPException(status_code=500, detail="Erro interno ao gerar token")
+
+@app.post("/validate-robo-token/", tags=['ROBOT'])
+def validate_robo_token(data: dict, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    token_str = data.get('token')
+    token = db.query(RobotToken).filter_by(user_id=user.id, token=token_str, used=False).first()
+    
+    if not token:
+        raise HTTPException(status_code=400, detail="Token inválido")
+
+    token.used = True
+    db.commit()
+
+    # Ativar modo robô global (ou por usuário, como preferir)
+    global modo_robo_ativo
+    modo_robo_ativo = True
+
+    return {"message": "Modo robô ativado"}
 
 
