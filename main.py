@@ -1,5 +1,9 @@
-from fastapi import FastAPI, Depends, Security, HTTPException, BackgroundTasks
-from fastapi.security import HTTPBearer
+from fastapi import FastAPI, Depends, Security, HTTPException, BackgroundTasks, Body
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+
 from sqlalchemy.orm import Session
 from stockfish import Stockfish
 from database.database import get_db 
@@ -10,7 +14,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 from uuid import uuid4
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 
 from Model.users import User
 from Model.games import Game
@@ -23,14 +27,12 @@ import jwt
 import math
 import os
 import chess
-import smtplib
 import serial
 
 app = FastAPI(
     title="Pychess",
     description="API com autenticação JWT",
     version="1.0",
-    openapi_tags=[{"name": "DB", "description": "Rotas que acessam o banco de dados"}],
     openapi_url="/openapi.json",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -71,6 +73,12 @@ game_history = []
 
 modo_robo_ativo = False
 
+templates = Jinja2Templates(directory="templates")
+
+@app.get("/", response_class=HTMLResponse, tags=['FRONT'])
+async def home(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request, "mensagem": "API e Front juntos 🚀"})
+
 def fen_to_matrix(fen):
     """Converte um FEN em uma matriz 8x8 representando o tabuleiro."""
     rows = fen.split(" ")[0].split("/")  # Pegamos apenas a parte do tabuleiro no FEN
@@ -87,46 +95,18 @@ def fen_to_matrix(fen):
 
     return board_matrix
 
-@app.post("/set_difficulty/",tags=['GAME'])
-def set_difficulty(level: str):
-    """Define o nível de dificuldade do Stockfish"""
-    
-    difficulty_settings = {
-        "muito_baixa": {"skill": 1, "depth": 2, "rating": 150},
-        "baixa": {"skill": 2, "depth": 4, "rating": 300},
-        "media": {"skill": 5, "depth": 8, "rating": 600},
-        "dificil": {"skill": 10, "depth": 14, "rating": 1200},
-        "extremo": {"skill": 20, "depth": 22, "rating": "MAX"}
-    }
-
-    level = level.lower()
-    
-    if level not in difficulty_settings:
-        raise HTTPException(status_code=400, detail="Nível inválido! Escolha entre: muito_baixa, baixa, media, dificil, extremo.")
-
-    settings = difficulty_settings[level]
-
-    stockfish.set_skill_level(settings["skill"])
-    stockfish.set_depth(settings["depth"])
-
-    return {
-        "message": f"Dificuldade ajustada para '{level}'",
-        "skill_level": settings["skill"],
-        "depth": settings["depth"],
-        "rating": settings["rating"]
-    }
-
 @app.post("/start_game/", tags=['GAME'])
-def start_game(user_id: int, db: Session = Depends(get_db)):
+def start_game(db: Session = Depends(get_db)):
     """ Inicia um novo jogo de xadrez e registra a posição inicial. """
     
     # Verifica se há algum jogo em andamento
     existing_game = db.query(Game).filter(Game.player_win == 0).first()
     if existing_game:
-        raise HTTPException(status_code=400, detail="Já existe um jogo em andamento!")
+        existing_game.player_win = 1
+        db.commit()
 
     # Criar um novo jogo
-    new_game = Game(user_id=user_id)
+    new_game = Game(user_id=1)
     db.add(new_game)
     db.commit()
     db.refresh(new_game)
@@ -344,41 +324,35 @@ def analyze_move(move: str,  db: Session = Depends(get_db)):
     }
 
 @app.post("/play_game/", tags=['GAME'])
-async def play_game(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    """ O sistema detecta o movimento físico no tabuleiro real e joga contra o Stockfish. """
+async def play_game(move: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """ O usuário joga, e o Stockfish responde com a melhor jogada, verificando capturas. """
 
-    # 1. Verifica se há um jogo ativo
+    # Verifica se há um jogo ativo
     game = db.query(Game).filter(Game.player_win == 0).first()
     if not game:
         raise HTTPException(status_code=400, detail="Nenhum jogo ativo encontrado!")
 
-    # 2. Recupera o último estado do FEN e converte para board
+    # Obtém o último estado salvo do tabuleiro
     last_move = db.query(Move).filter(Move.game_id == game.id).order_by(Move.id.desc()).first()
+
+    # Se houver um estado salvo, carregamos ele; caso contrário, criamos um novo tabuleiro
     board = chess.Board(last_move.board_string) if last_move and last_move.board_string else chess.Board()
 
-    # 3. Converte FEN para matriz para fazer comparação
-    previous_matrix = fen_to_matrix(board.board_fen())
-
-    # 4. Lê nova matriz via serial
-    current_matrix = read_board_matrix_serial(port='COM3', baudrate=9600)
-
-    # 5. Detecta movimento físico
-    from_square, to_square = detect_physical_move(previous_matrix, current_matrix)
-    if not from_square or not to_square:
-        raise HTTPException(status_code=400, detail="Não foi possível detectar o movimento!")
-
-    move = from_square + to_square  # Notação UCI
-
-    # 6. Valida jogada
+    # Verifica se a jogada do jogador é válida
     if move not in [m.uci() for m in board.legal_moves]:
-        raise HTTPException(status_code=400, detail=f"Movimento físico inválido: {move}")
+        raise HTTPException(status_code=400, detail="Movimento do jogador inválido!")
 
-    # 7. Aplica e salva jogada
+    # Aplica o movimento do jogador no tabuleiro
     board.push(chess.Move.from_uci(move))
+
+    # Atualiza o Stockfish com o novo estado do jogo
     stockfish.set_fen_position(board.fen())
+
+    # Análise da jogada
     analysis = analyze_move(move, db)
     classification = analysis["classification"]
 
+    # Salva o movimento do jogador no banco
     new_move = Move(
         is_player=True,
         move=move,
@@ -390,11 +364,12 @@ async def play_game(background_tasks: BackgroundTasks, db: Session = Depends(get
     db.add(new_move)
     db.commit()
 
-    # 8. Xeque-mate após jogada do jogador?
+    # Verifica xeque-mate após o movimento do jogador
     if board.is_checkmate():
-        game.player_win = 1
+        game.player_win = 1  # Brancas venceram
         db.commit()
         rating(game.user_id)
+
         return {
             "message": "Xeque-mate! Brancas venceram!",
             "board_fen": board.fen(),
@@ -402,34 +377,48 @@ async def play_game(background_tasks: BackgroundTasks, db: Session = Depends(get
             "stockfish_move": None
         }
 
-    # 9. Stockfish responde
+    # Stockfish responde com o melhor movimento
     best_move = stockfish.get_best_move()
-    if best_move and chess.Move.from_uci(best_move) in board.legal_moves:
-        board.push(chess.Move.from_uci(best_move))
-        stockfish.set_fen_position(board.fen())
+    if best_move:
+        stockfish_move = chess.Move.from_uci(best_move)
 
-        sf_move = Move(
-            is_player=False,
-            move=best_move,
-            board_string=board.fen(),
-            game_id=game.id,
-            mv_quality=None,
-            created_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        )
-        db.add(sf_move)
-        db.commit()
+        # Se for válido, aplicamos no tabuleiro
+        if stockfish_move in board.legal_moves:
+            board.push(stockfish_move)
+            stockfish.set_fen_position(board.fen())
 
-        if board.is_checkmate():
-            game.player_win = 2
+            # Salva a jogada do Stockfish
+            sf_move = Move(
+                is_player=False,
+                move=best_move,
+                board_string=board.fen(),
+                game_id=game.id,
+                mv_quality=None,
+                created_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            )
+            db.add(sf_move)
             db.commit()
-            rating(game.user_id)
+
+            # Verifica xeque-mate após a jogada do Stockfish
+            if board.is_checkmate():
+                game.player_win = 2  # Pretas venceram
+                db.commit()
+                rating(game.user_id)
+
+                return {
+                    "message": "Xeque-mate! Pretas venceram!",
+                    "board_fen": board.fen(),
+                    "player_move": move,
+                    "stockfish_move": best_move
+                }
+        else:
             return {
-                "message": "Xeque-mate! Pretas venceram!",
+                "message": "Movimento do Stockfish inválido. Tentando novamente...",
                 "board_fen": board.fen(),
                 "player_move": move,
-                "stockfish_move": best_move
+                "stockfish_move": None
             }
-
+        
     background_tasks.add_task(calculate_and_save_evaluation, game.id, db)
 
     return {
@@ -611,95 +600,52 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Security(securi
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+token_robot = 0; 
+
 @app.get("/get-robo-mode/", tags=['ROBOT'])
 def get_robo_mode():
     global modo_robo_ativo
 
     return {"robo_mode": modo_robo_ativo}
 
-@app.post("/set-robo-mode/", tags=['ROBOT'])
-def set_robo_mode(data: dict):
+@app.post("/verify-robo-token/", tags=['ROBOT'])
+def verify_robo_token(token: str = Body(..., embed=True)):
+    """Verifica se o token enviado pelo front é igual ao armazenado"""
+    global token_robot
     global modo_robo_ativo
-    ativo = data.get("ativo")
-    if ativo is None:
-        raise HTTPException(status_code=400, detail="Campo 'ativo' obrigatório")
-    modo_robo_ativo = bool(ativo)
+
+    if not token_robot:
+        raise HTTPException(status_code=400, detail="Nenhum token gerado ainda")
+    if token_robot == token:
+        modo_robo_ativo = True
+        return {"valid": True, "message": "Token válido! Modo robô ativado."}
+    else:
+        return {"valid": False, "message": "Token inválido!"}
+
+@app.post("/disable-robo-mode/", tags=['ROBOT'])
+def disable_robo_mode():
+    global modo_robo_ativo
+    
+    modo_robo_ativo = False
+
     return {"status": "ok", "robo_mode": modo_robo_ativo}
 
 
-def send_email(email: str, token: str):
-    msg = MIMEMultipart()
-    msg["From"] = os.getenv("SMTP_EMAIL")
-    msg["To"] = email
-    msg["Subject"] = "Token para ativar modo Robô"
-
-    body = f"""
-    <p>Olá,</p>
-    <p>Você solicitou ativar o modo robô em sua plataforma de xadrez.</p>
-    <p>Seu token de verificação é:</p>
-    <h2>{token}</h2>
-    <p>Copie e cole esse código no campo solicitado. Este token é válido por tempo limitado e só pode ser usado uma vez.</p>
-    <p>Se você não solicitou isso, ignore este e-mail.</p>
-    """
-
-    msg.attach(MIMEText(body, "html"))
-
-    try:
-        server = smtplib.SMTP(os.getenv("SMTP_SERVER"), os.getenv("SMTP_PORT"))
-        server.starttls()
-        server.login(os.getenv("SMTP_EMAIL"), os.getenv("SMTP_PASSWORD"))
-        server.sendmail(os.getenv("SMTP_EMAIL"), email, msg.as_string())
-        server.quit()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao enviar e-mail: {str(e)}")
-
 @app.post("/generate-robo-token/", tags=['ROBOT'])
-def generate_robo_token(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    try:
-        sete_dias_atras = datetime.utcnow() - timedelta(days=7)
-
-        # Verifica se já existe um token usado nos últimos 7 dias
-        existing_token = db.query(RobotToken).filter(
-            RobotToken.user_id == user.id,
-            RobotToken.used == True,
-            RobotToken.created_at >= sete_dias_atras
-        ).order_by(RobotToken.created_at.desc()).first()
-
-        if existing_token:
-            global modo_robo_ativo
-            modo_robo_ativo = True
-
-            return {"message": "Token já utilizado nos últimos 7 dias, modo robô já foi ativado recentemente."}
-
-        # Caso não exista, gerar novo token
-        token_str = str(uuid4()).split("-")[0]
-        token = RobotToken(user_id=user.id, token=token_str)
-        db.add(token)
-        db.commit()
-
-        send_email(user.email, token_str)
-
-        return {"message": "Token enviado para seu e-mail"}
-
-    except Exception as e:
-        print("❌ ERRO AO GERAR TOKEN:", e)
-        raise HTTPException(status_code=500, detail="Erro interno ao gerar token")
-
-@app.post("/validate-robo-token/", tags=['ROBOT'])
-def validate_robo_token(data: dict, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    token_str = data.get('token')
-    token = db.query(RobotToken).filter_by(user_id=user.id, token=token_str, used=False).first()
-    
-    if not token:
-        raise HTTPException(status_code=400, detail="Token inválido")
-
-    token.used = True
-    db.commit()
-
-    # Ativar modo robô global (ou por usuário, como preferir)
+def generate_robo_token():
+    global token_robot 
     global modo_robo_ativo
-    modo_robo_ativo = True
 
-    return {"message": "Modo robô ativado"}
+    if modo_robo_ativo == False:
+        try:
+            # Caso não exista, gerar novo token
+            token_str = str(uuid4()).split("-")[0]
+            token_robot = token_str
 
+            return {"message": "Token criado", "token": token_str}
 
+        except Exception as e:
+            print("❌ ERRO AO GERAR TOKEN:", e)
+            raise HTTPException(status_code=500, detail="Erro interno ao gerar token")
+        
+    return {"message": "Token já conectado"}
